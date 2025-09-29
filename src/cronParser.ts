@@ -218,15 +218,28 @@ export class CronParser {
 
     // Validate day-of-month against months
     if (this.daysOfMonth.values.length > 0 && this.months.values.length > 0) {
+      const maxDaysInMonth: Record<number, number> = {
+        1: 31, // January
+        2: 29, // February (leap year)
+        3: 31, // March
+        4: 30, // April
+        5: 31, // May
+        6: 30, // June
+        7: 31, // July
+        8: 31, // August
+        9: 30, // September
+        10: 31, // October
+        11: 30, // November
+        12: 31 // December
+      };
       for (const day of this.daysOfMonth.values) {
         for (const month of this.months.values) {
-          // Check across a range of years to catch leap year issues
-          const yearsToCheck = [2020, 2021, 2024, 2025, 2028]; // Include leap and non-leap years
-          for (const year of yearsToCheck) {
-            const dt = DateTime.fromObject({ year, month, day }, { zone: this.timezone });
-            if (dt.invalidReason) {
-              throw new CronError(`Invalid date: day ${day} is not valid for month ${monthNames[month - 1]}`);
-            }
+          if (month === 2 && day === 29) {
+            // February 29 is valid only in leap years, handled in getDayOfMonthSet
+            continue;
+          }
+          if (day > maxDaysInMonth[month]) {
+            throw new CronError(`Invalid date: day ${day} is not valid for month ${monthNames[month - 1]}`);
           }
         }
       }
@@ -318,7 +331,13 @@ export class CronParser {
       console.debug(`[getDayOfMonthSet] All days for ${year}-${month}: ${allDays}`);
       return allDays;
     }
-    const filteredDays = this.daysOfMonth.values.filter(d => d <= ldom);
+    const filteredDays = this.daysOfMonth.values.filter(d => {
+      if (month === 2 && d === 29) {
+        const isLeapYear = DateTime.fromObject({ year, month: 2, day: 1 }, { zone: this.timezone }).daysInMonth === 29;
+        return isLeapYear ? d <= ldom : false;
+      }
+      return d <= ldom;
+    });
     console.debug(`[getDayOfMonthSet] Filtered days of month for ${year}-${month}: ${filteredDays}`);
     return filteredDays;
   }
@@ -424,7 +443,7 @@ export class CronParser {
   }
 
   private getNextFireTime(after: DateTime): DateTime | null {
-    let d = after.plus({ seconds: 1 }).startOf('second');
+    let d = after.setZone(this.timezone);
     let iter = 0;
     const maxIter = 10000;
     const maxYear = this.years.values.length ? Math.max(...this.years.values) : 2099;
@@ -441,143 +460,126 @@ export class CronParser {
         console.debug(`[getNextFireTime] No next year found, returning null`);
         return null;
       }
-      const yearChanged = nextYear > d.year;
+      const yearChanged = nextYear !== d.year;
 
       // Month
       const monthValues = this.months.values.length ? this.months.values : Array.from({ length: 12 }, (_, i) => i + 1);
-      let nextMonth = this.getNextValue(monthValues, yearChanged ? monthValues[0] : d.month);
-      if (nextMonth === undefined) {
-        console.debug(`[getNextFireTime] No next month found, advancing year`);
-        nextYear = this.getNextValue(yearValues, nextYear + 1);
-        if (nextYear === undefined || nextYear > maxYear) {
-          console.debug(`[getNextFireTime] No further years available, returning null`);
-          return null;
-        }
-        nextMonth = monthValues[0];
-        d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
-        console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
-        continue;
-      }
-      const monthChanged = nextMonth > d.month || yearChanged;
+      let nextMonth = yearChanged ? monthValues[0] : this.getNextValue(monthValues, d.month) ?? monthValues[0];
+      const monthChanged = nextMonth !== d.month || yearChanged;
 
-      // Check if any valid days exist in this month
+      // Day
       const daySet = this.getDayOfMonthSet(nextYear, nextMonth);
       if (daySet.length === 0) {
         console.debug(`[getNextFireTime] No valid days in ${nextYear}-${nextMonth}, advancing year`);
-        nextYear = this.getNextValue(yearValues, nextYear + 1);
-        if (nextYear === undefined || nextYear > maxYear) {
+        const nextYearVal = this.getNextValue(yearValues, nextYear + 1);
+        if (nextYearVal === undefined || nextYearVal > maxYear) {
           console.debug(`[getNextFireTime] No further years available, returning null`);
           return null;
         }
-        nextMonth = monthValues[0];
-        d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
-        console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
+        nextYear = nextYearVal;
+        d = DateTime.fromObject({ year: nextYear, month: monthValues[0], day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
+        console.debug(`[getNextFireTime] Advancing to ${nextYear}-${monthValues[0]}`);
         continue;
       }
-
-      // Day
-      let nextDay = this.getNextValue(daySet, monthChanged ? daySet[0] : d.day);
-      if (nextDay === undefined) {
-        console.debug(`[getNextFireTime] No next day found, advancing year`);
-        nextYear = this.getNextValue(yearValues, nextYear + 1);
-        if (nextYear === undefined || nextYear > maxYear) {
-          console.debug(`[getNextFireTime] No further years available, returning null`);
-          return null;
-        }
-        nextMonth = monthValues[0];
-        d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
-        console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
-        continue;
-      }
-      const dayChanged = nextDay > d.day || monthChanged;
+      let nextDay = monthChanged ? daySet[0] : this.getNextValue(daySet, d.day) ?? daySet[0];
+      const dayChanged = nextDay !== d.day || monthChanged;
 
       // Hour
       const hourValues = this.hours.values.length ? this.hours.values : Array.from({ length: 24 }, (_, i) => i);
-      let nextHour = this.getNextValue(hourValues, dayChanged ? hourValues[0] : d.hour);
+      let nextHour = dayChanged ? hourValues[0] : this.getNextValue(hourValues, d.hour) ?? hourValues[0];
       if (nextHour === undefined) {
         console.debug(`[getNextFireTime] No next hour found, advancing day`);
-        nextDay = this.getNextValue(daySet, nextDay + 1);
-        if (nextDay === undefined) {
+        const nextDayVal = this.getNextValue(daySet, nextDay + 1);
+        if (nextDayVal === undefined) {
           console.debug(`[getNextFireTime] No next day found, advancing year`);
-          nextYear = this.getNextValue(yearValues, nextYear + 1);
-          if (nextYear === undefined || nextYear > maxYear) {
+          const nextYearVal = this.getNextValue(yearValues, nextYear + 1);
+          if (nextYearVal === undefined || nextYearVal > maxYear) {
             console.debug(`[getNextFireTime] No further years available, returning null`);
             return null;
           }
+          nextYear = nextYearVal;
           nextMonth = monthValues[0];
           d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
           console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
           continue;
         }
+        nextDay = nextDayVal;
         d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
         console.debug(`[getNextFireTime] Advancing to day ${nextDay}`);
         continue;
       }
-      const hourChanged = nextHour > d.hour || dayChanged;
+      const hourChanged = nextHour !== d.hour || dayChanged;
 
       // Minute
       const minuteValues = this.minutes.values.length ? this.minutes.values : Array.from({ length: 60 }, (_, i) => i);
-      let nextMinute = this.getNextValue(minuteValues, hourChanged ? minuteValues[0] : d.minute);
+      let nextMinute = hourChanged ? minuteValues[0] : this.getNextValue(minuteValues, d.minute) ?? minuteValues[0];
       if (nextMinute === undefined) {
         console.debug(`[getNextFireTime] No next minute found, advancing hour`);
-        nextHour = this.getNextValue(hourValues, nextHour + 1);
-        if (nextHour === undefined) {
+        const nextHourVal = this.getNextValue(hourValues, nextHour + 1);
+        if (nextHourVal === undefined) {
           console.debug(`[getNextFireTime] No next hour found, advancing day`);
-          nextDay = this.getNextValue(daySet, nextDay + 1);
-          if (nextDay === undefined) {
+          const nextDayVal = this.getNextValue(daySet, nextDay + 1);
+          if (nextDayVal === undefined) {
             console.debug(`[getNextFireTime] No next day found, advancing year`);
-            nextYear = this.getNextValue(yearValues, nextYear + 1);
-            if (nextYear === undefined || nextYear > maxYear) {
+            const nextYearVal = this.getNextValue(yearValues, nextYear + 1);
+            if (nextYearVal === undefined || nextYearVal > maxYear) {
               console.debug(`[getNextFireTime] No further years available, returning null`);
               return null;
             }
+            nextYear = nextYearVal;
             nextMonth = monthValues[0];
             d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
             console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
             continue;
           }
+          nextDay = nextDayVal;
           d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
           console.debug(`[getNextFireTime] Advancing to day ${nextDay}`);
           continue;
         }
+        nextHour = nextHourVal;
         d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: nextHour, minute: 0, second: 0 }, { zone: this.timezone });
         console.debug(`[getNextFireTime] Advancing to hour ${nextHour}`);
         continue;
       }
-      const minuteChanged = nextMinute > d.minute || hourChanged;
+      const minuteChanged = nextMinute !== d.minute || hourChanged;
 
       // Second
       const secondValues = this.seconds.values.length ? this.seconds.values : Array.from({ length: 60 }, (_, i) => i);
-      let nextSecond = this.getNextValue(secondValues, minuteChanged ? secondValues[0] : d.second);
+      let nextSecond = minuteChanged ? secondValues[0] : this.getNextValue(secondValues, d.second + 1) ?? secondValues[0];
       if (nextSecond === undefined) {
         console.debug(`[getNextFireTime] No next second found, advancing minute`);
-        nextMinute = this.getNextValue(minuteValues, nextMinute + 1);
-        if (nextMinute === undefined) {
+        const nextMinuteVal = this.getNextValue(minuteValues, nextMinute + 1);
+        if (nextMinuteVal === undefined) {
           console.debug(`[getNextFireTime] No next minute found, advancing hour`);
-          nextHour = this.getNextValue(hourValues, nextHour + 1);
-          if (nextHour === undefined) {
+          const nextHourVal = this.getNextValue(hourValues, nextHour + 1);
+          if (nextHourVal === undefined) {
             console.debug(`[getNextFireTime] No next hour found, advancing day`);
-            nextDay = this.getNextValue(daySet, nextDay + 1);
-            if (nextDay === undefined) {
+            const nextDayVal = this.getNextValue(daySet, nextDay + 1);
+            if (nextDayVal === undefined) {
               console.debug(`[getNextFireTime] No next day found, advancing year`);
-              nextYear = this.getNextValue(yearValues, nextYear + 1);
-              if (nextYear === undefined || nextYear > maxYear) {
+              const nextYearVal = this.getNextValue(yearValues, nextYear + 1);
+              if (nextYearVal === undefined || nextYearVal > maxYear) {
                 console.debug(`[getNextFireTime] No further years available, returning null`);
                 return null;
               }
+              nextYear = nextYearVal;
               nextMonth = monthValues[0];
               d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
               console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
               continue;
             }
+            nextDay = nextDayVal;
             d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
             console.debug(`[getNextFireTime] Advancing to day ${nextDay}`);
             continue;
           }
+          nextHour = nextHourVal;
           d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: nextHour, minute: 0, second: 0 }, { zone: this.timezone });
           console.debug(`[getNextFireTime] Advancing to hour ${nextHour}`);
           continue;
         }
+        nextMinute = nextMinuteVal;
         d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: nextHour, minute: nextMinute, second: 0 }, { zone: this.timezone });
         console.debug(`[getNextFireTime] Advancing to minute ${nextMinute}`);
         continue;
@@ -602,38 +604,7 @@ export class CronParser {
 
       // Advance to next possible time
       console.debug(`[getNextFireTime] No match for ${d.toISO()}, advancing`);
-      nextSecond = this.getNextValue(secondValues, nextSecond + 1);
-      if (nextSecond === undefined) {
-        nextMinute = this.getNextValue(minuteValues, nextMinute + 1);
-        if (nextMinute === undefined) {
-          nextHour = this.getNextValue(hourValues, nextHour + 1);
-          if (nextHour === undefined) {
-            nextDay = this.getNextValue(daySet, nextDay + 1);
-            if (nextDay === undefined) {
-              console.debug(`[getNextFireTime] No next day found, advancing year`);
-              nextYear = this.getNextValue(yearValues, nextYear + 1);
-              if (nextYear === undefined || nextYear > maxYear) {
-                console.debug(`[getNextFireTime] No further years available, returning null`);
-                return null;
-              }
-              nextMonth = monthValues[0];
-              d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: 1, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
-              console.debug(`[getNextFireTime] Advancing to ${nextYear}-${nextMonth}`);
-              continue;
-            }
-            d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: 0, minute: 0, second: 0 }, { zone: this.timezone });
-            console.debug(`[getNextFireTime] Advancing to day ${nextDay}`);
-            continue;
-          }
-          d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: nextHour, minute: 0, second: 0 }, { zone: this.timezone });
-          console.debug(`[getNextFireTime] Advancing to hour ${nextHour}`);
-          continue;
-        }
-        d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: nextHour, minute: nextMinute, second: 0 }, { zone: this.timezone });
-        console.debug(`[getNextFireTime] Advancing to minute ${nextMinute}`);
-        continue;
-      }
-      d = DateTime.fromObject({ year: nextYear, month: nextMonth, day: nextDay, hour: nextHour, minute: nextMinute, second: nextSecond }, { zone: this.timezone });
+      d = d.plus({ seconds: 1 }).startOf('second');
       console.debug(`[getNextFireTime] Iter ${iter}: Advancing to ${d.toISO()}`);
     }
     console.debug(`[getNextFireTime] No match found after ${iter} iterations`);
@@ -641,7 +612,7 @@ export class CronParser {
   }
 
   private getPreviousFireTime(before: DateTime): DateTime | null {
-    let d = before.minus({ seconds: 1 }).endOf('second');
+    let d = before.setZone(this.timezone).minus({ seconds: 1 }).endOf('second');
     let iter = 0;
     const maxIter = 10000;
     const minYear = this.years.values.length ? Math.min(...this.years.values) : 1970;
@@ -652,7 +623,7 @@ export class CronParser {
       iter++;
 
       // Year
-      const yearValues = this.years.values.length ? this.years.values : Array.from({ length: minYear - 1970 + 1 }, (_, i) => 1970 + i);
+      const yearValues = this.years.values.length ? this.years.values : Array.from({ length: 2099 - 1970 + 1 }, (_, i) => 1970 + i);
       let prevYear = this.getPreviousValue(yearValues, d.year);
       if (prevYear === undefined) {
         console.debug(`[getPreviousFireTime] No previous year found, returning null`);
@@ -662,68 +633,53 @@ export class CronParser {
 
       // Month
       const monthValues = this.months.values.length ? this.months.values : Array.from({ length: 12 }, (_, i) => i + 1);
-      let prevMonth = this.getPreviousValue(monthValues, yearChanged ? monthValues[monthValues.length - 1] : d.month);
-      if (prevMonth === undefined) {
-        console.debug(`[getPreviousFireTime] No previous month found, advancing year`);
-        prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-        if (prevYear === undefined || prevYear < minYear) {
-          console.debug(`[getPreviousFireTime] No further years available, returning null`);
-          return null;
-        }
-        prevMonth = monthValues[monthValues.length - 1];
-        d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
-        console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
-        continue;
-      }
+      let prevMonth = yearChanged ? monthValues[monthValues.length - 1] : this.getPreviousValue(monthValues, d.month) ?? monthValues[monthValues.length - 1];
       const monthChanged = prevMonth < d.month || yearChanged;
 
       // Day
       const daySet = this.getDayOfMonthSet(prevYear, prevMonth);
       if (daySet.length === 0) {
         console.debug(`[getPreviousFireTime] No valid days in ${prevYear}-${prevMonth}, advancing year`);
-        prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-        if (prevYear === undefined || prevYear < minYear) {
+        const prevYearVal = this.getPreviousValue(yearValues, prevYear - 1);
+        if (prevYearVal === undefined || prevYearVal < minYear) {
           console.debug(`[getPreviousFireTime] No further years available, returning null`);
           return null;
         }
+        prevYear = prevYearVal;
         prevMonth = monthValues[monthValues.length - 1];
-        d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
+        d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: DateTime.fromObject({ year: prevYear, month: prevMonth }, { zone: this.timezone }).daysInMonth ?? 30, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
         console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
         continue;
       }
-      let prevDay = this.getPreviousValue(daySet, monthChanged ? daySet[daySet.length - 1] : d.day);
-      if (prevDay === undefined) {
-        console.debug(`[getPreviousFireTime] No previous day found, advancing year`);
-        prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-        if (prevYear === undefined || prevYear < minYear) {
-          console.debug(`[getPreviousFireTime] No further years available, returning null`);
-          return null;
-        }
-        prevMonth = monthValues[monthValues.length - 1];
-        d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
-        console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
-        continue;
-      }
+      let prevDay = monthChanged ? daySet[daySet.length - 1] : this.getPreviousValue(daySet, d.day) ?? daySet[daySet.length - 1];
       const dayChanged = prevDay < d.day || monthChanged;
 
       // Hour
       const hourValues = this.hours.values.length ? this.hours.values : Array.from({ length: 24 }, (_, i) => i);
-      let prevHour = this.getPreviousValue(hourValues, dayChanged ? hourValues[hourValues.length - 1] : d.hour);
+      let prevHour = dayChanged ? hourValues[hourValues.length - 1] : this.getPreviousValue(hourValues, d.hour) ?? hourValues[hourValues.length - 1];
       if (prevHour === undefined) {
         console.debug(`[getPreviousFireTime] No previous hour found, advancing day`);
-        prevDay = this.getPreviousValue(daySet, prevDay - 1);
-        if (prevDay === undefined) {
-          console.debug(`[getPreviousFireTime] No previous day found, advancing year`);
-          prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-          if (prevYear === undefined || prevYear < minYear) {
-            console.debug(`[getPreviousFireTime] No further years available, returning null`);
-            return null;
+        const prevDayVal = this.getPreviousValue(daySet, prevDay - 1);
+        if (prevDayVal === undefined) {
+          console.debug(`[getPreviousFireTime] No previous day found, advancing month`);
+          const prevMonthVal = this.getPreviousValue(monthValues, prevMonth - 1);
+          if (prevMonthVal === undefined) {
+            console.debug(`[getPreviousFireTime] No previous month found, advancing year`);
+            const prevYearVal = this.getPreviousValue(yearValues, prevYear - 1);
+            if (prevYearVal === undefined || prevYearVal < minYear) {
+              console.debug(`[getPreviousFireTime] No further years available, returning null`);
+              return null;
+            }
+            prevYear = prevYearVal;
+            prevMonth = monthValues[monthValues.length - 1];
+          } else {
+            prevMonth = prevMonthVal;
           }
-          prevMonth = monthValues[monthValues.length - 1];
-          d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
+          d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: DateTime.fromObject({ year: prevYear, month: prevMonth }, { zone: this.timezone }).daysInMonth ?? 30, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
           console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
           continue;
         }
+        prevDay = prevDayVal;
         d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
         console.debug(`[getPreviousFireTime] Advancing to day ${prevDay}`);
         continue;
@@ -732,29 +688,38 @@ export class CronParser {
 
       // Minute
       const minuteValues = this.minutes.values.length ? this.minutes.values : Array.from({ length: 60 }, (_, i) => i);
-      let prevMinute = this.getPreviousValue(minuteValues, hourChanged ? minuteValues[minuteValues.length - 1] : d.minute);
+      let prevMinute = hourChanged ? minuteValues[minuteValues.length - 1] : this.getPreviousValue(minuteValues, d.minute) ?? minuteValues[minuteValues.length - 1];
       if (prevMinute === undefined) {
         console.debug(`[getPreviousFireTime] No previous minute found, advancing hour`);
-        prevHour = this.getPreviousValue(hourValues, prevHour - 1);
-        if (prevHour === undefined) {
+        const prevHourVal = this.getPreviousValue(hourValues, prevHour - 1);
+        if (prevHourVal === undefined) {
           console.debug(`[getPreviousFireTime] No previous hour found, advancing day`);
-          prevDay = this.getPreviousValue(daySet, prevDay - 1);
-          if (prevDay === undefined) {
-            console.debug(`[getPreviousFireTime] No previous day found, advancing year`);
-            prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-            if (prevYear === undefined || prevYear < minYear) {
-              console.debug(`[getPreviousFireTime] No further years available, returning null`);
-              return null;
+          const prevDayVal = this.getPreviousValue(daySet, prevDay - 1);
+          if (prevDayVal === undefined) {
+            console.debug(`[getPreviousFireTime] No previous day found, advancing month`);
+            const prevMonthVal = this.getPreviousValue(monthValues, prevMonth - 1);
+            if (prevMonthVal === undefined) {
+              console.debug(`[getPreviousFireTime] No previous month found, advancing year`);
+              const prevYearVal = this.getPreviousValue(yearValues, prevYear - 1);
+              if (prevYearVal === undefined || prevYearVal < minYear) {
+                console.debug(`[getPreviousFireTime] No further years available, returning null`);
+                return null;
+              }
+              prevYear = prevYearVal;
+              prevMonth = monthValues[monthValues.length - 1];
+            } else {
+              prevMonth = prevMonthVal;
             }
-            prevMonth = monthValues[monthValues.length - 1];
-            d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
+            d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: DateTime.fromObject({ year: prevYear, month: prevMonth }, { zone: this.timezone }).daysInMonth ?? 30, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
             console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
             continue;
           }
+          prevDay = prevDayVal;
           d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
           console.debug(`[getPreviousFireTime] Advancing to day ${prevDay}`);
           continue;
         }
+        prevHour = prevHourVal;
         d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: prevHour, minute: 59, second: 59 }, { zone: this.timezone });
         console.debug(`[getPreviousFireTime] Advancing to hour ${prevHour}`);
         continue;
@@ -763,36 +728,46 @@ export class CronParser {
 
       // Second
       const secondValues = this.seconds.values.length ? this.seconds.values : Array.from({ length: 60 }, (_, i) => i);
-      let prevSecond = this.getPreviousValue(secondValues, minuteChanged ? secondValues[secondValues.length - 1] : d.second);
+      let prevSecond = minuteChanged ? secondValues[secondValues.length - 1] : this.getPreviousValue(secondValues, d.second) ?? secondValues[secondValues.length - 1];
       if (prevSecond === undefined) {
         console.debug(`[getPreviousFireTime] No previous second found, advancing minute`);
-        prevMinute = this.getPreviousValue(minuteValues, prevMinute - 1);
-        if (prevMinute === undefined) {
+        const prevMinuteVal = this.getPreviousValue(minuteValues, prevMinute - 1);
+        if (prevMinuteVal === undefined) {
           console.debug(`[getPreviousFireTime] No previous minute found, advancing hour`);
-          prevHour = this.getPreviousValue(hourValues, prevHour - 1);
-          if (prevHour === undefined) {
+          const prevHourVal = this.getPreviousValue(hourValues, prevHour - 1);
+          if (prevHourVal === undefined) {
             console.debug(`[getPreviousFireTime] No previous hour found, advancing day`);
-            prevDay = this.getPreviousValue(daySet, prevDay - 1);
-            if (prevDay === undefined) {
-              console.debug(`[getPreviousFireTime] No previous day found, advancing year`);
-              prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-              if (prevYear === undefined || prevYear < minYear) {
-                console.debug(`[getPreviousFireTime] No further years available, returning null`);
-                return null;
+            const prevDayVal = this.getPreviousValue(daySet, prevDay - 1);
+            if (prevDayVal === undefined) {
+              console.debug(`[getPreviousFireTime] No previous day found, advancing month`);
+              const prevMonthVal = this.getPreviousValue(monthValues, prevMonth - 1);
+              if (prevMonthVal === undefined) {
+                console.debug(`[getPreviousFireTime] No previous month found, advancing year`);
+                const prevYearVal = this.getPreviousValue(yearValues, prevYear - 1);
+                if (prevYearVal === undefined || prevYearVal < minYear) {
+                  console.debug(`[getPreviousFireTime] No further years available, returning null`);
+                  return null;
+                }
+                prevYear = prevYearVal;
+                prevMonth = monthValues[monthValues.length - 1];
+              } else {
+                prevMonth = prevMonthVal;
               }
-              prevMonth = monthValues[monthValues.length - 1];
-              d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
+              d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: DateTime.fromObject({ year: prevYear, month: prevMonth }, { zone: this.timezone }).daysInMonth ?? 30, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
               console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
               continue;
             }
+            prevDay = prevDayVal;
             d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
             console.debug(`[getPreviousFireTime] Advancing to day ${prevDay}`);
             continue;
           }
+          prevHour = prevHourVal;
           d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: prevHour, minute: 59, second: 59 }, { zone: this.timezone });
           console.debug(`[getPreviousFireTime] Advancing to hour ${prevHour}`);
           continue;
         }
+        prevMinute = prevMinuteVal;
         d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: prevHour, minute: prevMinute, second: 59 }, { zone: this.timezone });
         console.debug(`[getPreviousFireTime] Advancing to minute ${prevMinute}`);
         continue;
@@ -817,38 +792,7 @@ export class CronParser {
 
       // Advance to previous possible time
       console.debug(`[getPreviousFireTime] No match for ${d.toISO()}, advancing`);
-      prevSecond = this.getPreviousValue(secondValues, prevSecond - 1);
-      if (prevSecond === undefined) {
-        prevMinute = this.getPreviousValue(minuteValues, prevMinute - 1);
-        if (prevMinute === undefined) {
-          prevHour = this.getPreviousValue(hourValues, prevHour - 1);
-          if (prevHour === undefined) {
-            prevDay = this.getPreviousValue(daySet, prevDay - 1);
-            if (prevDay === undefined) {
-              console.debug(`[getPreviousFireTime] No previous day found, advancing year`);
-              prevYear = this.getPreviousValue(yearValues, prevYear - 1);
-              if (prevYear === undefined || prevYear < minYear) {
-                console.debug(`[getPreviousFireTime] No further years available, returning null`);
-                return null;
-              }
-              prevMonth = monthValues[monthValues.length - 1];
-              d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: 31, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
-              console.debug(`[getPreviousFireTime] Advancing to ${prevYear}-${prevMonth}`);
-              continue;
-            }
-            d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: 23, minute: 59, second: 59 }, { zone: this.timezone });
-            console.debug(`[getPreviousFireTime] Advancing to day ${prevDay}`);
-            continue;
-          }
-          d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: prevHour, minute: 59, second: 59 }, { zone: this.timezone });
-          console.debug(`[getPreviousFireTime] Advancing to hour ${prevHour}`);
-          continue;
-        }
-        d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: prevHour, minute: prevMinute, second: 59 }, { zone: this.timezone });
-        console.debug(`[getPreviousFireTime] Advancing to minute ${prevMinute}`);
-        continue;
-      }
-      d = DateTime.fromObject({ year: prevYear, month: prevMonth, day: prevDay, hour: prevHour, minute: prevMinute, second: prevSecond }, { zone: this.timezone });
+      d = d.minus({ seconds: 1 }).endOf('second');
       console.debug(`[getPreviousFireTime] Iter ${iter}: Advancing to ${d.toISO()}`);
     }
     console.debug(`[getPreviousFireTime] No match found after ${iter} iterations`);
@@ -925,7 +869,10 @@ export class CronParser {
   }
 
   private describeField({ values, step }: CronField, name: string, min: number, max: number, formatter?: (value: number) => string): string {
-    const displayValues = formatter ? values.map(formatter) : values.map(v => {
+    const displayValues: string[] = values.map(v => {
+      if (formatter) {
+        return formatter(v);
+      }
       if (name === 'day' && !step) {
         const suffixes = ['th', 'st', 'nd', 'rd', 'th', 'th', 'th', 'th', 'th', 'th'];
         const suffix = v % 100 >= 11 && v % 100 <= 13 ? 'th' : suffixes[v % 10];
@@ -945,9 +892,9 @@ export class CronParser {
       return `every ${step} ${name}s from ${displayValues[0]} to ${displayValues[displayValues.length - 1]}`;
     }
     if (values.length === 1) {
-      return `at ${name} ${displayValues[0]}` + (name === 'second' ? ' of every minute' : '');
+      return name === 'day' ? `on the ${displayValues[0]} of the month` : `at ${name} ${displayValues[0]}` + (name === 'second' ? ' of every minute' : '');
     }
-    return `at ${name}s ${displayValues.join(' and ')}`;
+    return name === 'day' ? `on the ${displayValues.join(' and ')} of the month` : `at ${name}s ${displayValues.join(' and ')}`;
   }
 
   private describeSeconds(): string {
